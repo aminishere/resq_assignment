@@ -7,14 +7,19 @@ from datetime import datetime, date
 
 API_URL = "https://export.arxiv.org/api/query"
 
+
 QUERIES = [
-    "machine learning",
-    "deep learning",
-    "computer vision",
-    "natural language processing",
-    "robotics",
-    "reinforcement learning",
-    "multimodal learning",
+    "AI Scientist",
+    "automated scientific discovery",
+    "automated scientific research",
+    "scientific research agents",
+    "LLM-based scientific agents",
+    "automated literature review",
+    "scientific information retrieval",
+    "scientific RAG",
+    "scientific hypothesis generation",
+    "research question generation",
+    "scientific novelty evaluation",
 ]
 
 MAX_PAPERS = 70
