@@ -5,83 +5,68 @@ import re
 import time
 import requests
 
-from pathlib import Path
 from bs4 import BeautifulSoup
 
 
-# CONFIGURATION
-
-MANIFEST_FILE = "paper_manifest.csv"
-OUTPUT_FILE = "extraction_candidates.jsonl"
+INPUT_FILE = "paper_manifest.csv"
+OUTPUT_FILE = "questions.jsonl"
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
 MODEL = "qwen3:0.6b"
-
-MAX_RETRIES = 3
-REQUEST_TIMEOUT = 180
-SLEEP_SECONDS = 1
-
-MAX_ABSTRACT_CHARS = 3000
-MAX_INTRO_CHARS = 10000
-MAX_CONCLUSION_CHARS = 5000
-
-HEADERS = {
-    "User-Agent": "ResearchQuestionDataset/1.0"
-}
-
-
-# PROMPT
-
 PROMPT = """
-You are helping construct a dataset of research questions
-from academic research papers.
+You are a senior reviewer for a top-tier AI conference
+(e.g., ICLR, NeurIPS, ACL).
 
-Identify the central research question addressed by the paper.
+You will receive a paper abstract and other sections of the paper.
 
-Instructions:
+Your task is to identify the central research question.
 
-1. Identify the main problem or objective investigated.
-2. Write one clear, concise interrogative sentence.
-3. The question may be implicit. Reconstruct it using the
-   title, abstract, introduction and conclusion.
-4. Be permissive. Generate a reasonable question even when
-   information is incomplete.
-5. Focus on the underlying research problem, not just the
-   proposed technique or model.
-6. Do not simply turn the title into a question.
-7. Do not invent unsupported details.
-8. Return an empty question only when virtually no research
-   objective can be identified.
+GUIDELINES:
 
-Return ONLY valid JSON:
+1. Identify the underlying scientific problem being addressed.
+
+2. Consider the research idea and its contributions together.
+
+3. Focus on the knowledge gap, limitation, or challenge
+   that motivates the research.
+
+4. Do not simply rewrite the research idea as a question.
+
+5. Do not generate a list of questions.
+
+6. The question should capture the central objective
+   of the research.
+
+7. Do not invent motivations or research gaps that are
+   unsupported by the supplied information.
+
+8. Write one concise, specific, meaningful research question.
+
+REASONING:
+
+Briefly explain why this question captures the central
+research objective.
+
+Connect the question to the research idea and its
+main contributions.
+
+Return ONLY valid JSON in this exact format:
 
 {
-    "extracted_question": "One research question?",
-    "reasoning": "Brief explanation."
+    "question": "The central research question?",
+    "reasoning": "Explanation of why this question represents the research objective."
 }
 """
 
 
-# TEXT UTILITIES
+def clean(text):
+    return re.sub(r"\s+", " ", text).strip()
 
-def clean_text(text):
-    return re.sub(r"\s+", " ", text.replace("\u00a0", " ")).strip()
+def get_paper(arxiv_id):
 
+    url = f"https://arxiv.org/html/{arxiv_id}"
 
-def normalize_arxiv_id(paper_id):
-    paper_id = str(paper_id).strip().rstrip("/").split("/")[-1]
-    return re.sub(r"v\d+$", "", paper_id)
-
-
-# HTML EXTRACTION
-
-def extract_html(arxiv_id):
-
-    response = requests.get(
-        f"https://arxiv.org/html/{arxiv_id}",
-        headers=HEADERS,
-        timeout=60
-    )
+    response = requests.get(url, timeout=120)
     response.raise_for_status()
 
     soup = BeautifulSoup(response.text, "html.parser")
@@ -89,254 +74,129 @@ def extract_html(arxiv_id):
     for tag in soup(["script", "style", "nav", "footer"]):
         tag.decompose()
 
-    abstract_element = soup.find(class_="ltx_abstract") or soup.find("abstract")
-
-    abstract = ""
-    if abstract_element:
-        abstract = clean_text(abstract_element.get_text(" ", strip=True))
+    full_text = clean(soup.get_text(" ", strip=True))
 
     introduction = ""
     conclusion = ""
 
-    for heading in soup.find_all(["h1", "h2", "h3", "h4"]):
+    for heading in soup.find_all(re.compile(r"^h[1-6]$")):
 
-        heading_text = clean_text(heading.get_text(" ", strip=True)).lower()
+        heading_text = clean(heading.get_text()).lower()
 
-        section = heading.find_parent(
-            lambda tag: tag.name == "section"
-            or (tag.get("class") and any("ltx_section" in c for c in tag["class"]))
-        )
-
-        if section is None:
-            continue
-
-        section_text = clean_text(section.get_text(" ", strip=True))
-
-        if heading_text.startswith("1 introduction") or heading_text == "introduction":
-            introduction = section_text
-
-        if "conclusion" in heading_text or "concluding remarks" in heading_text:
-            conclusion = section_text
-
-    full_text = clean_text(soup.get_text(" ", strip=True))
-
-    return {
-        "abstract": abstract,
-        "introduction": introduction or full_text[:MAX_INTRO_CHARS],
-        "conclusion": conclusion or full_text[-MAX_CONCLUSION_CHARS:],
-        "source": "arXiv HTML"
-    }
-
-
-# GET PAPER CONTENT
-
-def get_paper_text(paper):
-
-    content = {
-        "abstract": paper.get("abstract", ""),
-        "introduction": "",
-        "conclusion": "",
-        "source": "Manifest abstract only"
-    }
-
-    try:
-        html = extract_html(normalize_arxiv_id(paper["arxiv_id"]))
-
-        if html["abstract"]:
-            content["abstract"] = html["abstract"]
-
-        content["introduction"] = html["introduction"]
-        content["conclusion"] = html["conclusion"]
-        content["source"] = "arXiv HTML + manifest abstract"
-
-    except Exception as error:
-        print(f"  HTML unavailable: {error}")
-        print("  Using manifest abstract.")
-
-    return content
-
-
-# MODEL INPUT
-
-def build_model_input(paper, content):
-
-    return f"""
-PAPER TITLE:
-{paper.get("title", "")}
-
-ABSTRACT:
-{content["abstract"][:MAX_ABSTRACT_CHARS]}
-
-INTRODUCTION:
-{content["introduction"][:MAX_INTRO_CHARS]}
-
-CONCLUSION:
-{content["conclusion"][:MAX_CONCLUSION_CHARS]}
-
-Identify the central research question.
-"""
-
-
-# OLLAMA
-
-def call_ollama(paper, content):
-
-    for attempt in range(MAX_RETRIES):
-
-        try:
-            response = requests.post(
-                OLLAMA_URL,
-                json={
-                    "model": MODEL,
-                    "messages": [
-                        {"role": "system", "content": PROMPT},
-                        {"role": "user", "content": build_model_input(paper, content)}
-                    ],
-                    "stream": False,
-                    "format": "json",
-                    "think": False,
-                    "options": {
-                        "temperature": 0,
-                        "num_ctx": 8192,
-                        "num_predict": 512
-                    }
-                },
-                timeout=REQUEST_TIMEOUT
+        if "introduction" in heading_text and not introduction:
+            introduction = clean(
+                heading.parent.get_text(" ", strip=True)
             )
 
-            response.raise_for_status()
+        if any(word in heading_text for word in [
+            "conclusion", "concluding", "discussion", "summary"
+        ]) and not conclusion:
 
-            return json.loads(response.json()["message"]["content"])
+            conclusion = clean(
+                heading.parent.get_text(" ", strip=True)
+            )
 
-        except Exception as error:
-            print(f"  Attempt {attempt + 1}/{MAX_RETRIES}: {error}")
+    return introduction, conclusion, full_text
 
-            if attempt == MAX_RETRIES - 1:
-                raise
+def extract_question(title, abstract, introduction, conclusion, full_text):
 
-            time.sleep(3)
+    paper = f"""
+TITLE:
+{title}
 
+ABSTRACT:
+{abstract}
 
-# VALIDATE MODEL OUTPUT
+INTRODUCTION:
+{introduction or "Not available"}
 
-def validate_extraction(result):
+CONCLUSION:
+{conclusion or "Not available"}
 
-    if not isinstance(result, dict):
-        raise ValueError("Invalid model response.")
+ADDITIONAL TEXT:
+{full_text[:10000]}
+"""
 
-    question = str(result.get("extracted_question", "")).strip()
-    reasoning = str(result.get("reasoning", "")).strip()
+    response = requests.post(
+        OLLAMA_URL,
+        json={
+            "model": MODEL,
+            "messages": [
+                {"role": "system", "content": PROMPT},
+                {"role": "user", "content": paper}
+            ],
+            "stream": False,
+            "format": "json",
+            "options": {
+                "temperature": 0.2,
+                "num_ctx": 8192
+            }
+        },
+        timeout=120
+    )
 
-    if question and not question.endswith("?"):
-        question += "?"
+    response.raise_for_status()
 
-    return question, reasoning
+    content = response.json()["message"]["content"]
 
+    return json.loads(content)
 
-# CHECKPOINTING
-
-def load_completed_ids():
-
-    completed = set()
-    path = Path(OUTPUT_FILE)
-
-    if not path.exists():
-        return completed
-
-    with path.open("r", encoding="utf-8") as file:
-        for line in file:
-            try:
-                record = json.loads(line)
-
-                if record.get("status") in ["pending", "completed", "no_question"]:
-                    completed.add(record["arxiv_id"])
-
-            except (json.JSONDecodeError, KeyError):
-                continue
-
-    return completed
-
-
-def save_record(record):
-
-    with open(OUTPUT_FILE, "a", encoding="utf-8") as file:
-        file.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-
-# MAIN PIPELINE
 
 def main():
 
-    if not Path(MANIFEST_FILE).exists():
-        raise FileNotFoundError(f"Manifest not found: {MANIFEST_FILE}")
-
-    with open(MANIFEST_FILE, "r", encoding="utf-8", newline="") as file:
+    with open(INPUT_FILE, encoding="utf-8") as file:
         papers = list(csv.DictReader(file))
 
     if not papers:
-        raise ValueError("Manifest is empty.")
+        print("Manifest is empty. Nothing to process.")
+        return
 
-    completed_ids = load_completed_ids()
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as output:
 
-    print(f"Manifest papers: {len(papers)}")
-    print(f"Already extracted: {len(completed_ids)}")
-    print(f"Model: {MODEL}")
+        for i, paper in enumerate(papers, 1):
 
-    successful = skipped = failed = 0
+            arxiv_id = paper.get("arxiv_id", "").strip()
+            title = paper.get("title", "").strip()
+            abstract = clean(paper.get("abstract", "") or "")
 
-    for index, paper in enumerate(papers, start=1):
+            print(f"\nProcessing {i}/{len(papers)}: {arxiv_id}")
 
-        arxiv_id = normalize_arxiv_id(paper.get("arxiv_id", ""))
+            if not arxiv_id or not title or not abstract:
+                print("Skipped: Missing ID, title, or abstract.")
+                continue
 
-        print(f"\n[{index}/{len(papers)}] Processing {arxiv_id}")
+            try:
 
-        if not arxiv_id:
-            print("  Missing arXiv ID.")
-            failed += 1
-            continue
+                introduction, conclusion, full_text = get_paper(arxiv_id)
 
-        if arxiv_id in completed_ids:
-            print("  Already processed. Skipping.")
-            skipped += 1
-            continue
+                result = extract_question(
+                    title,
+                    abstract,
+                    introduction,
+                    conclusion,
+                    full_text
+                )
 
-        try:
-            content = get_paper_text(paper)
+                record = {
+                    "arxiv_id": arxiv_id,
+                    "title": title,
+                    "question": result.get("question", ""),
+                    "reasoning": result.get("reasoning", ""),
+                    "human_reviewed_question": "",
+                    "status": "pending"
+                }
 
-            print(f"  Source: {content['source']}")
+                output.write(json.dumps(record, ensure_ascii=False) + "\n")
+                output.flush()
 
-            result = call_ollama(paper, content)
-            question, reasoning = validate_extraction(result)
+                print("Question:", record["question"])
 
-            record = {
-                "paper_id": paper.get("paper_id", ""),
-                "arxiv_id": arxiv_id,
-                "title": paper.get("title", ""),
-                "publication_date": paper.get("publication_date", ""),
-                "extracted_question": question,
-                "reasoning": reasoning,
-                "human_review": "",
-                "status": "pending",
-                "model": MODEL
-            }
+            except Exception as error:
+                print(f"Failed: {arxiv_id} | {error}")
 
-            save_record(record)
-            completed_ids.add(arxiv_id)
+            time.sleep(2)
 
-            successful += 1
-            print(f"  Question: {question}")
-
-        except Exception as error:
-            print(f"  Failed: {error}")
-            failed += 1
-
-        time.sleep(SLEEP_SECONDS)
-
-    print("\n========== SUMMARY ==========")
-    print(f"Extracted: {successful}")
-    print(f"Skipped:   {skipped}")
-    print(f"Failed:    {failed}")
-    print(f"Output:    {OUTPUT_FILE}")
+    print("\nExtraction completed.")
 
 
 if __name__ == "__main__":
