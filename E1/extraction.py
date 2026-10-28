@@ -1,4 +1,3 @@
-
 import csv
 import json
 import re
@@ -6,7 +5,6 @@ import time
 import requests
 
 from bs4 import BeautifulSoup
-
 
 INPUT_FILE = "paper_manifest.csv"
 OUTPUT_FILE = "questions.jsonl"
